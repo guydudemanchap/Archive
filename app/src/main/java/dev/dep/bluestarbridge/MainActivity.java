@@ -1,223 +1,32 @@
 package dev.dep.bluestarbridge;
-
-import android.Manifest;
-import android.annotation.SuppressLint;
-import android.app.Activity;
-import android.bluetooth.BluetoothAdapter;
-import android.bluetooth.BluetoothDevice;
-import android.bluetooth.BluetoothGatt;
-import android.bluetooth.BluetoothGattCharacteristic;
-import android.bluetooth.BluetoothGattService;
-import android.bluetooth.BluetoothManager;
-import android.bluetooth.le.BluetoothLeScanner;
-import android.bluetooth.le.ScanCallback;
-import android.bluetooth.le.ScanResult;
-import android.bluetooth.le.ScanSettings;
-import android.content.pm.PackageManager;
-import android.os.Build;
-import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.text.InputType;
-import android.view.ViewGroup;
-import android.widget.ArrayAdapter;
-import android.widget.Button;
-import android.widget.EditText;
-import android.widget.LinearLayout;
-import android.widget.ListView;
-import android.widget.ScrollView;
-import android.widget.TextView;
-import android.widget.Toast;
-
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-
-import blufi.espressif.BlufiCallback;
-import blufi.espressif.BlufiClient;
-import blufi.espressif.params.BlufiConfigureParams;
-import blufi.espressif.params.BlufiParameter;
-import blufi.espressif.response.BlufiScanResult;
-import blufi.espressif.response.BlufiStatusResponse;
-import blufi.espressif.response.BlufiVersionResponse;
-
-@SuppressLint("MissingPermission")
-public class MainActivity extends Activity {
-    private static final int PERM_REQ = 44;
-    private final Handler main = new Handler(Looper.getMainLooper());
-    private final Map<String, ScanResult> found = new LinkedHashMap<>();
-    private final List<ScanResult> shown = new ArrayList<>();
-    private final List<String> labels = new ArrayList<>();
-
-    private BluetoothAdapter adapter;
-    private BluetoothLeScanner scanner;
-    private BlufiClient client;
-    private boolean ready;
-    private ArrayAdapter<String> listAdapter;
-    private TextView state, log;
-    private EditText ssid, password, custom;
-
-    @Override public void onCreate(Bundle b) {
-        super.onCreate(b);
-        BluetoothManager bm = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
-        adapter = bm == null ? null : bm.getAdapter();
-        buildUi();
-        requestPerms();
-    }
-
-    private void buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(14), dp(12), dp(14), dp(12));
-
-        TextView title = text("BlueStar IA518VXUS Bridge Lab", 22);
-        root.addView(title);
-        root.addView(text("AC prep: ON → COOL → 16°C → FAN AUTO → press HEALTH / SENSAIR / DISPLAY(LIGHT) / ROOM 5× within 7 seconds. Then Scan BLE.", 14));
-        state = text("State: idle", 16); root.addView(state);
-        root.addView(button("Scan BLE (8 sec)", v -> scan()));
-
-        ListView devices = new ListView(this);
-        listAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, labels);
-        devices.setAdapter(listAdapter);
-        devices.setOnItemClickListener((p,v,pos,id) -> { if (pos < shown.size()) connect(shown.get(pos).getDevice()); });
-        root.addView(devices, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(190)));
-
-        LinearLayout r1 = row();
-        r1.addView(button("Security", v -> { if (ok()) client.negotiateSecurity(); }), weight());
-        r1.addView(button("AC Wi-Fi Scan", v -> { if (ok()) client.requestDeviceWifiScan(); }), weight());
-        root.addView(r1);
-
-        LinearLayout r2 = row();
-        r2.addView(button("BLUFI Version", v -> { if (ok()) client.requestDeviceVersion(); }), weight());
-        r2.addView(button("Device Status", v -> { if (ok()) client.requestDeviceStatus(); }), weight());
-        root.addView(r2);
-
-        ssid = edit("2.4 GHz Wi-Fi SSID"); root.addView(ssid);
-        password = edit("Wi-Fi password");
-        password.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        root.addView(password);
-        root.addView(button("Provision AC onto Wi-Fi", v -> provision()));
-
-        custom = edit("Experimental custom BLUFI HEX e.g. 010203"); root.addView(custom);
-        root.addView(button("Send custom HEX", v -> sendHex()));
-        root.addView(button("Disconnect", v -> disconnect()));
-        root.addView(text("Diagnostic log", 18));
-        log = text("", 12); log.setTextIsSelectable(true);
-        ScrollView sv = new ScrollView(this); sv.addView(log);
-        root.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
-        setContentView(root);
-    }
-
-    private void requestPerms() {
-        List<String> p = new ArrayList<>();
-        if (Build.VERSION.SDK_INT >= 31) {
-            if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) p.add(Manifest.permission.BLUETOOTH_SCAN);
-            if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) p.add(Manifest.permission.BLUETOOTH_CONNECT);
-        } else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) p.add(Manifest.permission.ACCESS_FINE_LOCATION);
-        if (!p.isEmpty()) requestPermissions(p.toArray(new String[0]), PERM_REQ);
-    }
-
-    private boolean perms() {
-        if (Build.VERSION.SDK_INT >= 31) return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
-        return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
-    }
-
-    private final ScanCallback cb = new ScanCallback() {
-        @Override public void onScanResult(int type, ScanResult r) { add(r); }
-        @Override public void onBatchScanResults(List<ScanResult> rs) { for (ScanResult r: rs) add(r); }
-        @Override public void onScanFailed(int code) { append("BLE scan failed: " + code); }
-    };
-
-    private void add(ScanResult r) {
-        if (found.put(r.getDevice().getAddress(), r) == null) main.post(this::refresh);
-    }
-
-    private void refresh() {
-        shown.clear(); shown.addAll(found.values());
-        shown.sort((a,b) -> Integer.compare(b.getRssi(), a.getRssi()));
-        labels.clear();
-        for (ScanResult r: shown) {
-            String n = r.getDevice().getName(); if (n == null || n.trim().isEmpty()) n = "(unnamed BLE device)";
-            labels.add(n + "\n" + r.getDevice().getAddress() + "  RSSI " + r.getRssi());
-        }
-        listAdapter.notifyDataSetChanged();
-    }
-
-    private void scan() {
-        if (!perms()) { requestPerms(); toast("Grant Bluetooth permission and tap Scan again."); return; }
-        if (adapter == null || !adapter.isEnabled()) { toast("Turn Bluetooth on."); return; }
-        scanner = adapter.getBluetoothLeScanner(); if (scanner == null) { toast("BLE scanner unavailable."); return; }
-        found.clear(); refresh(); state.setText("State: scanning…"); append("Scanning all BLE devices for 8 seconds…");
-        scanner.startScan(null, new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), cb);
-        main.postDelayed(this::stopScan, 8000);
-    }
-
-    private void stopScan() {
-        try { if (scanner != null) scanner.stopScan(cb); } catch (Exception ignored) {}
-        state.setText("State: scan done — tap likely AC device"); append("Scan done: " + found.size() + " unique BLE device(s).");
-    }
-
-    private void connect(BluetoothDevice d) {
-        stopScan(); disconnect(); ready = false;
-        String n = d.getName(); if (n == null) n = "unnamed";
-        state.setText("State: connecting to " + n); append("Connecting candidate " + n + " / " + d.getAddress());
-        client = new BlufiClient(getApplicationContext(), d);
-        client.setGattWriteTimeout(5000);
-        client.setBlufiCallback(new BlufiCallback() {
-            @Override public void onGattPrepared(BlufiClient c, BluetoothGatt gatt, BluetoothGattService service, BluetoothGattCharacteristic write, BluetoothGattCharacteristic notify) {
-                if (service != null && write != null && notify != null) { ready = true; state.setText("State: BLUFI ready"); append("BLUFI service + FF01/FF02 discovered. Jackpot."); }
-                else { append("Not a usable BLUFI endpoint."); state.setText("State: not BLUFI"); }
-            }
-            @Override public void onNegotiateSecurityResult(BlufiClient c, int s) { append("Security result=" + s); }
-            @Override public void onPostConfigureParams(BlufiClient c, int s) { append("Provision payload result=" + s + (s==STATUS_SUCCESS ? " — request status/check router" : "")); }
-            @Override public void onDeviceScanResult(BlufiClient c, int s, List<BlufiScanResult> rs) {
-                append("AC Wi-Fi scan status=" + s + " count=" + (rs==null?0:rs.size()));
-                if (rs != null) for (BlufiScanResult x: rs) append("  " + x.toString());
-            }
-            @Override public void onDeviceStatusResponse(BlufiClient c, int s, BlufiStatusResponse x) {
-                if (s == STATUS_SUCCESS && x != null) append("STATUS opMode="+x.getOpMode()+" connected="+x.isStaConnectWifi()+" ssid="+x.getStaSSID()+" bssid="+x.getStaBSSID());
-                else append("Status request failed=" + s);
-            }
-            @Override public void onDeviceVersionResponse(BlufiClient c, int s, BlufiVersionResponse x) { append("Version status=" + s + " value=" + (x==null?"null":x.getVersionString())); }
-            @Override public void onPostCustomDataResult(BlufiClient c, int s, byte[] data) { append("Custom TX status="+s+" hex="+hex(data)); }
-            @Override public void onReceiveCustomData(BlufiClient c, int s, byte[] data) { append("Custom RX status="+s+" hex="+hex(data)); }
-            @Override public void onError(BlufiClient c, int code) { append("BLUFI ERROR=" + code); }
-        });
-        client.connect();
-    }
-
-    private void provision() {
-        if (!ok()) return;
-        String s = ssid.getText().toString().trim(); if (s.isEmpty()) { toast("Enter SSID."); return; }
-        BlufiConfigureParams p = new BlufiConfigureParams(); p.setOpMode(BlufiParameter.OP_MODE_STA);
-        p.setStaSSIDBytes(s.getBytes(StandardCharsets.UTF_8)); p.setStaPassword(password.getText().toString());
-        append("Provisioning SSID=" + s + " (password intentionally not logged)"); client.configure(p);
-    }
-
-    private void sendHex() {
-        if (!ok()) return;
-        try { byte[] b = parseHex(custom.getText().toString()); append("Custom TX " + hex(b)); client.postCustomData(b); }
-        catch (IllegalArgumentException e) { toast(e.getMessage()); }
-    }
-
-    private boolean ok() { if (client == null || !ready) { toast("Connect to a BLUFI device first."); return false; } return true; }
-    private void disconnect() { if (client != null) { try { client.close(); } catch (Exception ignored) {} client = null; } ready = false; }
-    private void append(String s) { main.post(() -> log.append(String.format(Locale.ENGLISH, "%tT  %s\n", System.currentTimeMillis(), s))); }
-
-    private static byte[] parseHex(String raw) {
-        String s = raw.replace(" ", "").replace(":", ""); if ((s.length() & 1) != 0) throw new IllegalArgumentException("Hex needs an even number of characters.");
-        byte[] out = new byte[s.length()/2]; for (int i=0;i<out.length;i++) { int a=Character.digit(s.charAt(i*2),16), b=Character.digit(s.charAt(i*2+1),16); if(a<0||b<0) throw new IllegalArgumentException("Invalid hex."); out[i]=(byte)((a<<4)|b); } return out;
-    }
-    private static String hex(byte[] b) { if (b==null) return "null"; StringBuilder s=new StringBuilder(); for(byte x:b)s.append(String.format(Locale.ENGLISH,"%02X",x&255)); return s.toString(); }
-    private TextView text(String s, int size) { TextView v=new TextView(this); v.setText(s); v.setTextSize(size); return v; }
-    private Button button(String s, android.view.View.OnClickListener l) { Button b=new Button(this); b.setText(s); b.setOnClickListener(l); return b; }
-    private EditText edit(String h) { EditText e=new EditText(this); e.setHint(h); e.setSingleLine(true); return e; }
-    private LinearLayout row() { LinearLayout r=new LinearLayout(this); r.setOrientation(LinearLayout.HORIZONTAL); return r; }
-    private LinearLayout.LayoutParams weight() { return new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1); }
-    private int dp(int x) { return Math.round(x*getResources().getDisplayMetrics().density); }
-    private void toast(String s) { Toast.makeText(this,s,Toast.LENGTH_LONG).show(); }
-    @Override protected void onDestroy() { stopScan(); disconnect(); super.onDestroy(); }
+import android.Manifest;import android.annotation.SuppressLint;import android.app.*;import android.bluetooth.*;import android.bluetooth.le.*;import android.content.*;import android.content.pm.PackageManager;import android.os.*;import android.text.InputType;import android.util.Base64;import android.view.*;import android.widget.*;import org.json.JSONObject;import java.net.*;import java.nio.charset.StandardCharsets;import java.security.SecureRandom;import java.util.*;import java.util.concurrent.*;import javax.crypto.Cipher;import javax.crypto.spec.*;import blufi.espressif.*;import blufi.espressif.response.*;
+@SuppressLint("MissingPermission") public class MainActivity extends Activity{
+ static final int P=44542;final Handler h=new Handler(Looper.getMainLooper());final ExecutorService io=Executors.newCachedThreadPool();BluetoothAdapter ba;BluetoothLeScanner sc;BlufiClient bc;ScanResult best;boolean prep,sec,neg;SharedPreferences sp;String uat,pending,thing,acip;volatile boolean listen;DatagramSocket ds;TextView st,info,log,last;EditText ssid,pw,tmp,ip;Button claim,id,ws,pr,on,off,set,lon,loff,lset;
+ public void onCreate(Bundle b){super.onCreate(b);sp=getSharedPreferences("lab",0);uat=sp.getString("uat",null);thing=sp.getString("thing",null);acip=sp.getString("ip",null);BluetoothManager m=(BluetoothManager)getSystemService(BLUETOOTH_SERVICE);ba=m==null?null:m.getAdapter();ui();perm();udp();L("v0.2: exact Blue Star BLUFI + local UDP/44542.");}
+ void ui(){LinearLayout r=new LinearLayout(this);r.setOrientation(LinearLayout.VERTICAL);r.setPadding(14,14,14,14);r.addView(t("BlueStar IA518VXUS Local Lab v0.2",22));r.addView(t("Pair AC: COOL 16°C + FAN AUTO, then HEALTH/SENSAIR/DISPLAY/ROOM 5× in 7 sec. Close official Blue Star app while testing.",13));st=t("Idle",16);info=t("",12);r.addView(st);r.addView(info);r.addView(b("SCAN + CONNECT BLUAC",v->scan()));claim=b("CLAIM LOCAL TOKEN",v->confirm());id=b("READ AC IDENTITY",v->id());row(r,claim,id);ws=b("AC WI-FI SCAN (TYPE 3)",v->wscan());r.addView(ws);ssid=e("2.4 GHz SSID");pw=e("Wi-Fi password (not saved/logged)");pw.setInputType(129);r.addView(ssid);r.addView(pw);pr=b("PROVISION WI-FI (TYPE 2)",v->provision());r.addView(pr);r.addView(t("Bluetooth direct",16));row(r,on=b("BLE ON",v->power(false,true)),off=b("BLE OFF",v->power(false,false)));tmp=e("Temperature 16–30");tmp.setInputType(InputType.TYPE_CLASS_NUMBER|InputType.TYPE_NUMBER_FLAG_DECIMAL);r.addView(tmp);set=b("SET TEMP BLE",v->temperature(false));r.addView(set);r.addView(t("Same-Wi-Fi direct (UDP 44542)",16));ip=e("AC IP (auto-learns from UDP state)");if(acip!=null)ip.setText(acip);r.addView(ip);row(r,lon=b("LAN ON",v->power(true,true)),loff=b("LAN OFF",v->power(true,false)));lset=b("SET TEMP LAN",v->temperature(true));r.addView(lset);last=t("Last decoded state: none",11);last.setTextIsSelectable(true);r.addView(last);r.addView(b("DEVICE STATUS",v->{if(bc!=null)bc.requestDeviceStatus();}));r.addView(b("COPY LOG",v->copy()));log=t("",11);log.setTextIsSelectable(true);ScrollView ls=new ScrollView(this);ls.addView(log);r.addView(ls,new LinearLayout.LayoutParams(-1,350));ScrollView o=new ScrollView(this);o.addView(r);setContentView(o);buttons(false);show();}
+ void row(LinearLayout r,Button a,Button b){LinearLayout x=new LinearLayout(this);x.addView(a,new LinearLayout.LayoutParams(0,-2,1));x.addView(b,new LinearLayout.LayoutParams(0,-2,1));r.addView(x);}TextView t(String s,int z){TextView v=new TextView(this);v.setText(s);v.setTextSize(z);return v;}Button b(String s,View.OnClickListener l){Button b=new Button(this);b.setText(s);b.setOnClickListener(l);return b;}EditText e(String s){EditText e=new EditText(this);e.setHint(s);e.setSingleLine();return e;}
+ void show(){info.setText("UAT "+mask(uat)+(thing==null?"":" · MAC "+thing)+(acip==null?"":" · LAN "+acip+":"+P));}
+ void perm(){if(Build.VERSION.SDK_INT>=31&&checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)!=PackageManager.PERMISSION_GRANTED)requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN,Manifest.permission.BLUETOOTH_CONNECT},9);}
+ final ScanCallback cb=new ScanCallback(){public void onScanResult(int x,ScanResult r){String n=r.getDevice().getName();if(n!=null&&n.startsWith("BLUAC_")&&(best==null||r.getRssi()>best.getRssi())){best=r;st.setText("Found "+n+" RSSI "+r.getRssi());}}};
+ void scan(){if(ba==null||!ba.isEnabled()){toast("Turn Bluetooth on");return;}best=null;sc=ba.getBluetoothLeScanner();st.setText("Scanning BLUAC…");sc.startScan(null,new ScanSettings.Builder().setScanMode(2).build(),cb);h.postDelayed(()->{try{sc.stopScan(cb);}catch(Exception e){}if(best==null){st.setText("No BLUAC found");return;}connect(best.getDevice());},6000);}
+ void connect(BluetoothDevice d){close();String n=d.getName();thing=n!=null&&n.startsWith("BLUAC_")?n.substring(6).toLowerCase(Locale.ENGLISH):thing;if(thing!=null)sp.edit().putString("thing",thing).apply();show();L("Connect "+n+" / "+d.getAddress());bc=new BlufiClient(getApplicationContext(),d);bc.setGattWriteTimeout(5000);bc.setGattCallback(new BluetoothGattCallback(){public void onMtuChanged(BluetoothGatt g,int mtu,int s){L("MTU "+mtu+" status "+s);security();}});bc.setBlufiCallback(new C());bc.connect();}
+ void security(){if(bc!=null&&!neg){neg=true;L("Auto security negotiation");bc.negotiateSecurity();}}
+ class C extends BlufiCallback{public void onGattPrepared(BlufiClient c,BluetoothGatt g,BluetoothGattService s,BluetoothGattCharacteristic w,BluetoothGattCharacteristic n){if(s==null||w==null||n==null){L("Not BLUFI");return;}prep=true;L("BLUFI FFFF/FF01/FF02 FOUND");boolean q=false;try{q=g.requestMtu(512);}catch(Exception e){}if(!q){c.setPostPackageLengthLimit(20);security();}}public void onNegotiateSecurityResult(BlufiClient c,int s){sec=s==0;L(sec?"SECURITY SUCCESS":"SECURITY FAIL "+s);st.setText(sec?"BLUFI secure / ready":"Security failed");buttons(sec);}public void onPostCustomDataResult(BlufiClient c,int s,byte[]d){custom("POST",s,d);}public void onReceiveCustomData(BlufiClient c,int s,byte[]d){custom("RX",s,d);}public void onDeviceScanResult(BlufiClient c,int s,List<BlufiScanResult>rs){L("Wi-Fi scan status="+s+" count="+(rs==null?0:rs.size()));if(rs!=null)for(BlufiScanResult x:rs)L("AP "+x);}public void onDeviceStatusResponse(BlufiClient c,int s,BlufiStatusResponse q){if(q!=null)L("STATUS mode="+q.getOpMode()+" connected="+q.isStaConnectWifi()+" ssid="+q.getStaSSID()+" bssid="+q.getStaBSSID());}public void onError(BlufiClient c,int e){L("BLUFI ERROR "+e);}}
+ void confirm(){if(!sec)return;new AlertDialog.Builder(this).setTitle("Claim local token?").setMessage("This is Blue Star's real bind command (type 0). It can replace an existing official-app pairing token. Continue?").setNegativeButton("Cancel",null).setPositiveButton("Claim",(d,w)->claim()).show();}
+ void claim(){try{pending=UUID.randomUUID().toString();JSONObject j=new JSONObject();j.put("type",0);j.put("uat",pending);L("Bind type0 "+mask(pending));post(j);}catch(Exception e){L("bind "+e);}}
+ void id(){if(!ready())return;try{JSONObject j=new JSONObject();j.put("type",6);j.put("uat",uat);post(j);L("type6 identity request");}catch(Exception e){L("id "+e);}}
+ void wscan(){if(!ready())return;try{JSONObject j=new JSONObject();j.put("type",3);j.put("uat",uat);post(j);L("type3 Wi-Fi scan request");}catch(Exception e){L("scan "+e);}}
+ void provision(){if(!ready())return;try{JSONObject j=new JSONObject();j.put("type",2);j.put("uat",uat);j.put("ssid",ssid.getText().toString());j.put("pswd",pw.getText().toString());post(j);L("type2 provision SSID="+ssid.getText()+" password hidden");for(int i=1;i<=6;i++)h.postDelayed(()->{if(bc!=null)bc.requestDeviceStatus();},3000L*i);}catch(Exception e){L("provision "+e);}}
+ void custom(String src,int s,byte[]d){if(s!=0||d==null)return;String raw=new String(d,StandardCharsets.UTF_8).trim();L(src+" ← "+red(raw));try{JSONObject j=new JSONObject(raw);int t=j.optInt("type",-1);if(t==0&&pending!=null&&pending.equalsIgnoreCase(j.optString("uat"))){uat=pending;pending=null;sp.edit().putString("uat",uat).apply();show();L("BIND ACK; UAT accepted");id();}else if(t==6){L("IDENTITY PID="+j.optString("pid")+" board="+j.optString("boardId")+" rmt="+j.optInt("rmtType",1000)+" fw="+j.optString("iduMainFv"));}else if(t==4){L("Wi-Fi result reason="+j.optInt("reason",-1)+" (0 success,1 AP missing,2 bad password,3 filter,4 overload)");}else if(t==5)envelope("BLE",null,j.optString("state"));}catch(Exception e){}}
+ void post(JSONObject j){bc.postCustomData(j.toString().getBytes(StandardCharsets.UTF_8));}
+ boolean ready(){if(!sec||uat==null){toast("Need secure BLE + local token");return false;}return true;}
+ void power(boolean lan,boolean on){try{JSONObject d=new JSONObject();d.put("pow",on?1:0);desired(lan,d);}catch(Exception e){L("power "+e);}}void temperature(boolean lan){try{double v=Double.parseDouble(tmp.getText().toString());if(v<16||v>30){toast("16–30 only");return;}JSONObject d=new JSONObject();d.put("stemp",String.format(Locale.ENGLISH,"%.1f",v));desired(lan,d);}catch(Exception e){toast("Enter temp like 24");}}
+ void desired(boolean wlan,JSONObject d)throws Exception{if(!ready())return;d.put("src",wlan?"anlan":"anble");JSONObject s=new JSONObject();s.put("desired",d);JSONObject j=new JSONObject();j.put("type",1);j.put("uat",uat);j.put("state",s);if(!wlan){L("BLE desired → "+d);post(j);return;}String host=ip.getText().toString().trim();if(host.isEmpty()){toast("Wait for LAN IP or enter it");return;}String enc=enc(j.toString(),uat.substring(0,16));L("LAN desired → "+d+" @ "+host+":"+P);io.execute(()->burst(host,enc));}
+ void burst(String host,String data){try(DatagramSocket s=new DatagramSocket()){byte[]b=data.getBytes(StandardCharsets.US_ASCII);DatagramPacket p=new DatagramPacket(b,b.length,InetAddress.getByName(host),P);for(int i=0;i<25;i++){s.send(p);Thread.sleep(100);}L("LAN burst complete");}catch(Exception e){L("LAN send "+e);}}
+ void udp(){listen=true;io.execute(()->{try{DatagramSocket s=new DatagramSocket(null);s.setReuseAddress(true);s.bind(new InetSocketAddress(P));ds=s;L("UDP listener bound :44542");while(listen){byte[]b=new byte[2048];DatagramPacket p=new DatagramPacket(b,b.length);s.receive(p);String m=new String(p.getData(),0,p.getLength(),StandardCharsets.US_ASCII).trim(),src=p.getAddress().getHostAddress();if(m.startsWith("(")&&m.endsWith(")")&&m.contains("|"))h.post(()->envelope("UDP",src,m));}}catch(Exception e){if(listen)L("UDP listener error; close official app: "+e);}});}
+ void envelope(String via,String src,String m){try{int k=m.indexOf('|');String mac=m.substring(1,k).toLowerCase(Locale.ENGLISH),b64=m.substring(k+1,m.length()-1);thing=mac;sp.edit().putString("thing",mac).apply();if(src!=null){acip=src;sp.edit().putString("ip",src).apply();ip.setText(src);}show();if(uat==null){L(via+" state seen from "+mac+"; no UAT to decrypt");return;}String js=clean(dec(b64,uat.substring(0,16)));JSONObject q=new JSONObject(js);last.setText("Last state ("+via+"): "+q);L(via+" STATE ← "+q);}catch(Exception e){L(via+" decode "+e.getMessage());}}
+ static String enc(String raw,String key)throws Exception{byte[]r=new byte[16];new SecureRandom().nextBytes(r);Cipher c;try{c=Cipher.getInstance("AES/CBC/PKCS7Padding");}catch(Exception e){c=Cipher.getInstance("AES/CBC/PKCS5Padding");}c.init(1,new SecretKeySpec(key.getBytes(StandardCharsets.US_ASCII),"AES"),new IvParameterSpec(r));byte[]x=raw.getBytes(StandardCharsets.US_ASCII),p=new byte[16+x.length];System.arraycopy(r,0,p,0,16);System.arraycopy(x,0,p,16,x.length);return Base64.encodeToString(c.doFinal(p),2);}static byte[] dec(String b64,String key)throws Exception{byte[]a=Base64.decode(b64,2);Cipher c=Cipher.getInstance("AES/CBC/NoPadding");c.init(2,new SecretKeySpec(key.getBytes(StandardCharsets.US_ASCII),"AES"),new IvParameterSpec(Arrays.copyOfRange(a,0,16)));return c.doFinal(Arrays.copyOfRange(a,16,a.length));}static String clean(byte[]b){int n=b.length;while(n>0&&(b[n-1]&255)<=32)n--;return new String(b,0,n,StandardCharsets.US_ASCII).trim();}
+ void buttons(boolean x){claim.setEnabled(x);id.setEnabled(x&&uat!=null);ws.setEnabled(x&&uat!=null);pr.setEnabled(x&&uat!=null);on.setEnabled(x&&uat!=null);off.setEnabled(x&&uat!=null);set.setEnabled(x&&uat!=null);boolean l=uat!=null;lon.setEnabled(l);loff.setEnabled(l);lset.setEnabled(l);}void close(){if(bc!=null)try{bc.close();}catch(Exception e){}bc=null;prep=sec=neg=false;if(claim!=null)buttons(false);}void stopUdp(){listen=false;try{if(ds!=null)ds.close();}catch(Exception e){}}
+ String red(String r){try{JSONObject j=new JSONObject(r);if(j.has("uat"))j.put("uat",mask(j.optString("uat")));if(j.has("pswd"))j.put("pswd","***");return j.toString();}catch(Exception e){return r;}}static String mask(String s){return s==null?"none":s.length()<10?"***":s.substring(0,4)+"…"+s.substring(s.length()-4);}void L(String s){h.post(()->{if(log!=null)log.append(String.format(Locale.ENGLISH,"%tT %s\n",System.currentTimeMillis(),s));});}void copy(){ClipboardManager c=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE);c.setPrimaryClip(ClipData.newPlainText("BlueStar log",log.getText()));toast("Copied");}void toast(String s){Toast.makeText(this,s,Toast.LENGTH_LONG).show();}
+ protected void onDestroy(){try{if(sc!=null)sc.stopScan(cb);}catch(Exception e){}close();stopUdp();io.shutdownNow();super.onDestroy();}
 }
