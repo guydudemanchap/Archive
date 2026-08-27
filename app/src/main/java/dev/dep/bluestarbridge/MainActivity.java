@@ -332,7 +332,7 @@ public class MainActivity extends Activity {
     }
 
     void handleCustom(String src, int status, byte[] data) {
-        if (status != STATUS_SUCCESS || data == null) return;
+        if (status != BlufiCallback.STATUS_SUCCESS || data == null) return;
         String raw = new String(data, StandardCharsets.UTF_8).trim();
         log(src + " ← " + redact(raw));
         try {
